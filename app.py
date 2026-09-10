@@ -509,6 +509,7 @@ def tts_route():
     text = request.args.get("text", "radar")
     engine = pyttsx3.init()
     engine.setProperty('rate', 120)
+    engine.setProperty('voice', 'en-gb')
     filename = "tts_output.wav"
     engine.save_to_file(text, filename)
     engine.runAndWait()
