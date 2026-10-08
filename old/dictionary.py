@@ -21,6 +21,16 @@ from flask import Flask, render_template, request, jsonify, send_from_directory
 nltk.download('wordnet', quiet=False)
 nltk.download('words', quiet=False)
 
+nltk_lock = threading.Lock()
+
+def safe_wordnet_synsets(word):
+    with nltk_lock:
+        return wordnet.synsets(word)
+
+def safe_wordnet_all_lemma_names():
+    with nltk_lock:
+        return list(wordnet.all_lemma_names())
+
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "audio_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -49,7 +59,8 @@ def is_valid_real_word(w):
     return w_clean in CMU_DICT
 
 VOCAB = [
-    w.lower() for w in set(wordnet.all_lemma_names()) 
+    #w.lower() for w in set(wordnet.all_lemma_names()) 
+    w.lower() for w in set(safe_wordnet_all_lemma_names()) 
     if is_valid_real_word(w)
 ]
 VOCAB_SET = set(VOCAB)
@@ -341,6 +352,105 @@ def process_dictionary_word(word, used_palindromes): # TODO ensure that we don't
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# --- DISK CACHE SETUP ---
+PALINDROME_CACHE_DIR = os.path.join(os.path.dirname(__file__), "palindrome_cache")
+LLM_CACHE_DIR = os.path.join(os.path.dirname(__file__), "llm_cache")
+os.makedirs(PALINDROME_CACHE_DIR, exist_ok=True)
+os.makedirs(LLM_CACHE_DIR, exist_ok=True)
+
+def get_cached_data(word, cache_dir):
+    """Safely read a cached result from disk."""
+    filepath = os.path.join(cache_dir, f"{word}.txt")
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            return content if content else None
+    return None
+
+def write_cached_data(word, cache_dir, data):
+    """Write a result to disk."""
+    filepath = os.path.join(cache_dir, f"{word}.txt")
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(str(data))
+
+def palindrome_worker():
+    print("[Worker] Palindrome cache worker started.")
+    used_palindromes = []
+    
+    for word in VOCAB:
+        cached = get_cached_data(word, PALINDROME_CACHE_DIR)
+        
+        # If it's not cached, generate it
+        if cached is None:
+            try:
+                result = process_dictionary_word(word, used_palindromes)
+                if result and result.get('palindrome'):
+                    pal = result['palindrome']
+                    write_cached_data(word, PALINDROME_CACHE_DIR, pal)
+                    used_palindromes.append(pal)
+                else:
+                    # Write an empty string or placeholder so we don't keep trying
+                    write_cached_data(word, PALINDROME_CACHE_DIR, "NONE")
+            except Exception as e:
+                print(f"[Worker] Palindrome error for {word}: {e}")
+            
+            # Yield CPU so narration and web server stay responsive
+            time.sleep(0.05)
+
+def llm_example_worker(narrator_ref):
+    print("[Worker] LLM usage-example cache worker started.")
+    
+    for word in VOCAB:
+        cached = get_cached_data(word, LLM_CACHE_DIR)
+        
+        if cached is None:
+            # Grab basic definition to feed the LLM context
+            #synsets = wordnet.synsets(word)
+            synsets = safe_wordnet_synsets(word)
+            definition = synsets[0].definition() if synsets else None
+            
+            try: # FIXME should also know which definition this example is for
+                example = narrator_ref._generate_ollama_example(word, definition)
+                if example:
+                    write_cached_data(word, LLM_CACHE_DIR, example)
+                else:
+                    write_cached_data(word, LLM_CACHE_DIR, "NONE")
+            except Exception as e:
+                print(f"[Worker] LLM error for {word}: {e}")
+            
+            # Rate limit the local LLM so it doesn't melt your GPU/CPU
+            time.sleep(1.0)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ==========================================
 # Metrical Foot Prosodic Dictionary
 # ==========================================
@@ -541,7 +651,7 @@ class MorseAudioGenerator:
         return tone
 
     #def spell_to_morse_wav(self, word, filename, dot_ms=60, silence_ms=800):
-    def spell_to_morse_wav(self, word, filename, dot_ms=100, silence_ms=1000):
+    def spell_to_morse_wav(self, word, filename, dot_ms=125, silence_ms=1000):
         print('spell_to_morse_wav')
         dash_ms = dot_ms * 3
         elem_space = np.zeros(int(self.sample_rate * (dot_ms / 1000.0)))
@@ -771,7 +881,8 @@ class SyncedNarratorState:
         filtered = []
         for w in raw_words:
             w_clean = w.lower().strip()
-            has_definition = bool(wordnet.synsets(w_clean))
+            #has_definition = bool(wordnet.synsets(w_clean))
+            has_definition = bool(safe_wordnet_synsets(w_clean))
             #if w_clean in self.valid_english or has_definition:
             if w_clean in self.valid_english and has_definition:
                 filtered.append(w_clean)
@@ -819,11 +930,21 @@ class SyncedNarratorState:
 
     def get_word_details(self, word):
         print('get_word_details')
-        synsets = wordnet.synsets(word)
+        #synsets = wordnet.synsets(word)
+        synsets = safe_wordnet_synsets(word)
         homophones = self.phonics_engine.get_homophones(word)
+
+        # Look for the cached example instead of calling the LLM directly
+        cached_example = get_cached_data(word, LLM_CACHE_DIR)
+        if cached_example and cached_example != "NONE":
+            example = cached_example
+        #elif examples: # fallback to wordnet examples
+        #    example = examples[0]
+        else:
+            example = None # Leave it blank; the worker will catch up eventually
         
         if not synsets:
-            example = self._generate_ollama_example(word, None)
+            #example = self._generate_ollama_example(word, None)
             return {
                 "senses": [{
                     "pos": None,
@@ -842,7 +963,9 @@ class SyncedNarratorState:
             pos_full = self.pos_map.get(syn.pos(), 'word')
             definition = syn.definition()
             examples = syn.examples()
-            example = examples[0] if examples else self._generate_ollama_example(word, definition)
+            #example = examples[0] if examples else self._generate_ollama_example(word, definition)
+            if not example:
+                example = examples[0] if examples else None
 
             synonyms, antonyms, hypernyms, hyponyms = set(), set(), set(), set()
             
@@ -865,7 +988,7 @@ class SyncedNarratorState:
             senses.append({
                 "pos": pos_full,
                 "definition": definition,
-                "example": example,
+                "example": example, # TODO multiple examples
                 "synonyms": list(synonyms),
                 "antonyms": list(antonyms),
                 "hypernyms": list(hypernyms),
@@ -910,7 +1033,7 @@ class SyncedNarratorState:
             self._save_persisted_state()
 
         for word in group_words:
-            details = self.get_word_details(word)
+            details = self.get_word_details(word) # TODO multiple examples
 
             with self.lock:
                 self.current_state["current_word"] = word
@@ -954,18 +1077,28 @@ class SyncedNarratorState:
                     self.spelling_bee(word, foot_name)
                     self._broadcast_phrase("Definition Index", f"Definition {idx} of {num_senses}.", f"def_idx_{idx}")
 
-                try:
-                    #_palindrome = process_dictionary_word(word, palindromes)
-                    _palindrome = None # FIXME takes too long ?
-                    palindrome = _palindrome['palindrome'] if _palindrome else None
-                    if palindrome:
-                        assert palindrome != word
-                        self._broadcast_phrase("Saying Pseudo-palindrome", f"Pseudo-palindromic Example: {palindrome}.", "say_palindrome")
-                        self._broadcast_phrase("Pseudo-palindromic example", "", "morse_repeat", is_morse=True, word=palindrome)
-                        self._broadcast_phrase("Saying Pseudo-palindrome", f"{palindrome}", "say_palindrome")
-                        palindromes.append(palindrome)
-                except Exception as e:
-                    print(f'failed to process_dictionary_word for {word}: {e}')
+                #try:
+                #    #_palindrome = process_dictionary_word(word, palindromes)
+                #    _palindrome = None # FIXME takes too long ?
+                #    palindrome = _palindrome['palindrome'] if _palindrome else None
+                #    if palindrome:
+                #        assert palindrome != word
+                #        self._broadcast_phrase("Saying Pseudo-palindrome", f"Pseudo-palindromic Example: {palindrome}.", "say_palindrome")
+                #        self._broadcast_phrase("Pseudo-palindromic example", "", "morse_repeat", is_morse=True, word=palindrome)
+                #        self._broadcast_phrase("Saying Pseudo-palindrome", f"{palindrome}", "say_palindrome")
+                #        palindromes.append(palindrome)
+                #except Exception as e:
+                #    print(f'failed to process_dictionary_word for {word}: {e}')
+
+                # TODO multiple palindromes
+                # Look for the cached palindrome
+                cached_palindrome = get_cached_data(word, PALINDROME_CACHE_DIR)
+
+                if cached_palindrome and cached_palindrome != "NONE":
+                    # It's instant!
+                    self._broadcast_phrase("Saying Pseudo-palindrome", f"Pseudo-palindromic Example: {cached_palindrome}.", "say_palindrome")
+                    self._broadcast_phrase("Pseudo-palindromic example", "", "morse_repeat", is_morse=True, word=cached_palindrome)
+                    self._broadcast_phrase("Saying Pseudo-palindrome", f"{cached_palindrome}", "say_palindrome")
 
                 if sense['pos']:
                     self._broadcast_phrase("Part of Speech", f"Part of speech: {sense['pos']}.", f"pos_{idx}")
@@ -973,7 +1106,7 @@ class SyncedNarratorState:
                 if sense['definition']:
                     self._broadcast_phrase("Definition", f"Definition: {sense['definition']}", f"def_{idx}")
 
-                if sense['example']:
+                if sense['example']: # TODO multiple examples
                     self._broadcast_phrase("Example Sentence", f"Example: {sense['example']}", f"example_{idx}")
 
                 if sense['synonyms']:
@@ -1173,6 +1306,15 @@ def search_word():
     return jsonify({"status": "error", "message": message}), 404
 
 if __name__ == "__main__":
-    t = threading.Thread(target=narration_worker, daemon=True)
-    t.start()
+    # 1. Start the Narration Worker
+    t1 = threading.Thread(target=narration_worker, daemon=True)
+    t1.start()
+
+    # 2. Start the Palindrome Background Worker
+    t2 = threading.Thread(target=palindrome_worker, daemon=True)
+    t2.start()
+
+    # 3. Start the LLM Background Worker (pass in narrator_state)
+    t3 = threading.Thread(target=llm_example_worker, args=(narrator_state,), daemon=True)
+    t3.start()
     app.run(host="0.0.0.0", port=5003, debug=False)
